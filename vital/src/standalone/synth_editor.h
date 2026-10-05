@@ -57,8 +57,10 @@ class SynthEditor : public AudioAppComponent, public SynthBase, public SynthGuiI
     void setComputerKeyboardOffset(int offset) override;
     const CriticalSection& getAudioLock() override { return critical_section_; }
     String getGuiPresetName() override { return getPresetName(); }
+    void renderOffline(AudioSampleBuffer& buffer, int num_samples) override;
 
   private:
+    void renderBlock(const AudioSourceChannelInfo& buffer);
     std::unique_ptr<DawEngine> daw_;
     std::unique_ptr<SynthComputerKeyboard> computer_keyboard_;
     CriticalSection critical_section_;

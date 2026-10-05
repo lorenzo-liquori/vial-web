@@ -486,6 +486,8 @@ EM_JS (void, juce_web_setup, (), {
 
     W.isTextFieldTarget = function (e) {
         var t = e.target;
+        if (Module.flwebHost && ! Module.flwebHost.wantsKeys (e))
+            return true;
         return t && t !== document.body && (t.tagName == "INPUT" || t.tagName == "TEXTAREA" || t.isContentEditable);
     };
 

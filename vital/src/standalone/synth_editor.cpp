@@ -26,6 +26,14 @@
 #include "startup.h"
 #include "utils.h"
 
+#if JUCE_EMSCRIPTEN
+#include <emscripten.h>
+EM_JS(int, flweb_host_channels_js, (), { return (Module.flwebHost && Module.flwebHost.channels) || 0; });
+static int outputChannels() { int n = flweb_host_channels_js(); return n > 2 ? n : vital::kNumChannels; }
+#else
+static int outputChannels() { return vital::kNumChannels; }
+#endif
+
 SynthEditor::SynthEditor(bool use_gui) : SynthGuiInterface(this, use_gui) {
   static constexpr int kHeightBuffer = 50;
 
@@ -35,12 +43,12 @@ SynthEditor::SynthEditor(bool use_gui) : SynthGuiInterface(this, use_gui) {
   computer_keyboard_ = std::make_unique<SynthComputerKeyboard>(engine_.get(), keyboard_state_.get());
   current_time_ = 0.0;
 
-  setAudioChannels(0, vital::kNumChannels);
+  setAudioChannels(0, outputChannels());
 
   AudioDeviceManager::AudioDeviceSetup setup;
   deviceManager.getAudioDeviceSetup(setup);
   setup.sampleRate = vital::kDefaultSampleRate;
-  deviceManager.initialise(0, vital::kNumChannels, nullptr, true, "", &setup);
+  deviceManager.initialise(0, outputChannels(), nullptr, true, "", &setup);
 
   if (deviceManager.getCurrentAudioDevice() == nullptr) {
     const OwnedArray<AudioIODeviceType>& device_types = deviceManager.getAvailableDeviceTypes();
@@ -97,7 +105,20 @@ void SynthEditor::prepareToPlay(int buffer_size, double sample_rate) {
   daw_->prepare(sample_rate);
 }
 
+void SynthEditor::renderOffline(AudioSampleBuffer& buffer, int num_samples) {
+  AudioSourceChannelInfo info(&buffer, 0, num_samples);
+  renderBlock(info);
+}
+
 void SynthEditor::getNextAudioBlock(const AudioSourceChannelInfo& buffer) {
+  if (daw_->offlineActive()) {
+    buffer.clearActiveBufferRegion();
+    return;
+  }
+  renderBlock(buffer);
+}
+
+void SynthEditor::renderBlock(const AudioSourceChannelInfo& buffer) {
   ScopedLock lock(getCriticalSection());
 
   int num_samples = buffer.buffer->getNumSamples();

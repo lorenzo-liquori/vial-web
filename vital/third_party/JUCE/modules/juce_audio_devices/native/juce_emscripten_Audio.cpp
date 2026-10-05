@@ -1,9 +1,25 @@
+// FLWeb host: posizione (frame dell'anello) del blocco che si sta calcolando, letta da DawEngine
+std::atomic<int> flweb_render_position { 0 };
+
 namespace juce
 {
+
+EM_JS (int, juce_webaudio_hostChannels, (), {
+    return (Module.flwebHost && Module.flwebHost.channels) || 0;
+});
 
 EM_JS (void, juce_webaudio_open, (int deviceId, double sampleRate, int numChannels, int capacity,
                                   float* channelData, int* readIndex, int* writeIndex, int* underrunIndex), {
     var A = Module.juceAudio = Module.juceAudio || { devices: {} };
+
+    if (Module.flwebHost)
+    {
+        A.devices[deviceId] = { ctx: Module.flwebHost.ctx, node: null, closed: false, host: true };
+        Module.flwebHost.attach ({ buffer: wasmMemory.buffer, channels: numChannels, capacity: capacity,
+                                   data: channelData >> 2, readIndex: readIndex >> 2, writeIndex: writeIndex >> 2,
+                                   underrunIndex: underrunIndex >> 2, offsetIndex: (underrunIndex >> 2) + 4 });
+        return;
+    }
 
     if (! A.gestureHooked)
     {
@@ -171,6 +187,12 @@ EM_JS (void, juce_webaudio_close, (int deviceId), {
     if (! A || ! A.devices[deviceId]) return;
     var dev = A.devices[deviceId];
     dev.closed = true;
+    if (dev.host)
+    {
+        try { Module.flwebHost.detach(); } catch (err) {}
+        delete A.devices[deviceId];
+        return;
+    }
     if (dev.node)
     {
         try { dev.node.port.postMessage ({ type: "stop" }); } catch (err) {}
@@ -182,6 +204,8 @@ EM_JS (void, juce_webaudio_close, (int deviceId), {
 
 EM_JS (double, juce_webaudio_defaultSampleRate, (), {
     var A = Module.juceAudio = Module.juceAudio || { devices: {} };
+    if (Module.flwebHost)
+        return Module.flwebHost.ctx.sampleRate;
     if (! A.defaultRate)
     {
         try {
@@ -211,7 +235,16 @@ public:
         close();
     }
 
-    StringArray getOutputChannelNames() override   { return { "Left", "Right" }; }
+    StringArray getOutputChannelNames() override
+    {
+        int n = juce_webaudio_hostChannels();
+        if (n <= 2)
+            return { "Left", "Right" };
+        StringArray names;
+        for (int i = 0; i < n; ++i)
+            names.add ("Out " + String (i + 1));
+        return names;
+    }
     StringArray getInputChannelNames() override    { return {}; }
 
     Array<double> getAvailableSampleRates() override
@@ -237,7 +270,7 @@ public:
 
         blockSize = jlimit (32, 4096, bufferSizeSamples);
         activeOutputs = outputChannels;
-        activeOutputs.setRange (2, activeOutputs.getHighestBit() + 1, false);
+        activeOutputs.setRange (jmax (2, juce_webaudio_hostChannels()), activeOutputs.getHighestBit() + 1, false);
         numOutputs = jmax (1, activeOutputs.countNumberOfSetBits());
 
         minimumFill = jmax (blockSize * 2, juce_webaudio_isMobile() ? 2048 : 1024);
@@ -404,6 +437,7 @@ private:
             }
 
             renderBuffer.clear();
+            flweb_render_position.store (w);
 
             {
                 const ScopedLock sl (callbackLock);

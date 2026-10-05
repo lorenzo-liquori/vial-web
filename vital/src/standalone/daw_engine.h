@@ -18,6 +18,7 @@ class DawHost {
     virtual void setComputerKeyboardOffset(int offset) = 0;
     virtual const CriticalSection& getAudioLock() = 0;
     virtual String getGuiPresetName() = 0;
+    virtual void renderOffline(AudioSampleBuffer& buffer, int num_samples) = 0;
 };
 
 class DawSynth : public HeadlessSynth {
@@ -116,6 +117,14 @@ class DawEngine {
     void freeCapture();
     void panic() { panic_requested_ = true; }
     int keyboardOffset(int offset);
+
+    // FLWeb host: ogni traccia (0..kMaxSynths-1) esce su una sua coppia di canali, note a frame esatto
+    void hostEnable(int pairs);
+    void hostNote(int track, int note, int velocity, bool on, int frame);
+    void offlineBegin();
+    void offlineEnd();
+    int offlineRender(float* out, int frames);
+    bool offlineActive() const { return offline_; }
 
   private:
     struct Track {
@@ -253,6 +262,23 @@ class DawEngine {
     MidiBuffer synth_midi_[kMaxSynths];
     AudioSampleBuffer scratch_;
     AudioSampleBuffer mix_;
+
+    struct HostEvent {
+      int track;
+      int note;
+      int velocity;
+      int on;
+      int frame;
+    };
+    void dispatchHost(int base, int num_samples, MidiBuffer& gui_out);
+    void endBlockHost(AudioSampleBuffer& buffer, int num_samples);
+    std::atomic<int> host_pairs_ { 0 };
+    AbstractFifo host_fifo_ { 8192 };
+    HostEvent host_events_[8192];
+    std::vector<HostEvent> host_pending_;
+    std::atomic<bool> offline_ { false };
+    bool offline_rendering_ = false;
+    int offline_pos_ = 0;
 
     std::vector<float> capture_[2];
     std::atomic<bool> capturing_ { false };

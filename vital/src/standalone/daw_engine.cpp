@@ -9,6 +9,7 @@
 #include <cstring>
 
 DawEngine* DawEngine::instance = nullptr;
+extern std::atomic<int> flweb_render_position;
 
 DawSynth::DawSynth() { }
 
@@ -576,6 +577,9 @@ void DawEngine::beginBlock(MidiBuffer& live, int num_samples, MidiBuffer& gui_ou
       route = -1;
   }
 
+  if (host_pairs_ > 0)
+    dispatchHost(offline_rendering_ ? offline_pos_ : flweb_render_position.load(), num_samples, gui_out);
+
   double seek = seek_request_.exchange(-1e18);
   if (seek > -1e17) {
     allNotesOff(0, gui_out);
@@ -727,8 +731,132 @@ void DawEngine::meter(int track, const AudioSampleBuffer& buffer, int num_sample
   *(l + 1) = std::max((double)peak_r, *(l + 1) * decay);
 }
 
+void DawEngine::hostEnable(int pairs) {
+  host_pairs_ = std::max(0, std::min(kMaxSynths, pairs));
+  num_tracks_ = host_pairs_ > 0 ? kMaxSynths : 0;
+  host_pending_.reserve(8192);
+}
+
+void DawEngine::hostNote(int track, int note, int velocity, bool on, int frame) {
+  int start1, size1, start2, size2;
+  host_fifo_.prepareToWrite(1, start1, size1, start2, size2);
+  HostEvent event { track, note, velocity, on ? 1 : 0, frame };
+  if (size1 > 0)
+    host_events_[start1] = event;
+  else if (size2 > 0)
+    host_events_[start2] = event;
+  host_fifo_.finishedWrite(size1 + size2);
+}
+
+void DawEngine::dispatchHost(int base, int num_samples, MidiBuffer& gui_out) {
+  int start1, size1, start2, size2;
+  host_fifo_.prepareToRead(host_fifo_.getNumReady(), start1, size1, start2, size2);
+  for (int i = 0; i < size1; ++i)
+    host_pending_.push_back(host_events_[start1 + i]);
+  for (int i = 0; i < size2; ++i)
+    host_pending_.push_back(host_events_[start2 + i]);
+  host_fifo_.finishedRead(size1 + size2);
+  if (host_pending_.empty())
+    return;
+
+  // prima le note in ordine di tempo; a parita' di frame il note-off prima del note-on
+  std::stable_sort(host_pending_.begin(), host_pending_.end(), [](const HostEvent& a, const HostEvent& b) {
+    return (a.frame - b.frame) < 0 || (a.frame == b.frame && a.on < b.on);
+  });
+
+  size_t keep = 0;
+  for (size_t i = 0; i < host_pending_.size(); ++i) {
+    const HostEvent& e = host_pending_[i];
+    int offset = e.frame - base;
+    if (offset >= num_samples) {
+      host_pending_[keep++] = e;
+      continue;
+    }
+    int sample = std::max(0, offset);
+    if (e.track < 0 || e.track >= kMaxSynths || tracks_[e.track].type != kSynth)
+      continue;
+    int note = std::max(0, std::min(127, e.note));
+    if (e.on)
+      routeNoteOn(e.track, note, std::max(1, std::min(127, e.velocity)), sample, gui_out);
+    else
+      routeNoteOff(e.track, tracks_[e.track].slot, note, sample, gui_out);
+  }
+  host_pending_.resize(keep);
+}
+
+void DawEngine::endBlockHost(AudioSampleBuffer& buffer, int num_samples) {
+  float bpm = (float)bpm_.load();
+  int channels = buffer.getNumChannels();
+  for (int c = 0; c < 2; ++c)
+    scratch_.copyFrom(c, 0, buffer, std::min(c, channels - 1), 0, num_samples);
+  for (int c = 0; c < channels; ++c)
+    buffer.clear(c, 0, num_samples);
+
+  int pairs = std::min((int)host_pairs_, channels / 2);
+  for (int track = 0; track < kMaxSynths; ++track) {
+    if (tracks_[track].type != kSynth)
+      continue;
+    int slot = tracks_[track].slot;
+    AudioSampleBuffer* source = nullptr;
+    if (slot == 0)
+      source = &scratch_;
+    else if (slot > 0 && slot < kMaxSynths && synths_[slot]) {
+      mix_.clear(0, 0, num_samples);
+      mix_.clear(1, 0, num_samples);
+      synths_[slot]->render(mix_, synth_midi_[slot], num_samples, bpm);
+      source = &mix_;
+    }
+    if (source == nullptr || track >= pairs)
+      continue;
+    meter(track, *source, num_samples);
+    buffer.copyFrom(track * 2, 0, *source, 0, 0, num_samples);
+    buffer.copyFrom(track * 2 + 1, 0, *source, 1, 0, num_samples);
+  }
+  status_[kStatusSampleRate] = sample_rate_;
+  status_[kStatusLatency] = latency_samples_;
+}
+
+void DawEngine::offlineBegin() {
+  offline_ = true;
+  ScopedLock lock(host_->getAudioLock());
+  offline_pos_ = 0;
+  host_pending_.clear();
+  panic_requested_ = true;
+}
+
+void DawEngine::offlineEnd() {
+  {
+    ScopedLock lock(host_->getAudioLock());
+    host_pending_.clear();
+    panic_requested_ = true;
+  }
+  offline_ = false;
+}
+
+int DawEngine::offlineRender(float* out, int frames) {
+  int channels = std::max(2, (int)host_pairs_ * 2);
+  std::vector<float*> pointers((size_t)channels);
+  int done = 0;
+  offline_rendering_ = true;
+  while (done < frames) {
+    int n = std::min(512, frames - done);
+    for (int c = 0; c < channels; ++c)
+      pointers[(size_t)c] = out + (size_t)c * frames + done;
+    AudioSampleBuffer block(pointers.data(), channels, n);
+    host_->renderOffline(block, n);
+    offline_pos_ += n;
+    done += n;
+  }
+  offline_rendering_ = false;
+  return done;
+}
+
 void DawEngine::endBlock(AudioSampleBuffer& buffer, int num_samples) {
   num_samples = std::min(num_samples, kMaxBlock);
+  if (host_pairs_ > 0) {
+    endBlockHost(buffer, num_samples);
+    return;
+  }
   int num_tracks = num_tracks_;
   float bpm = (float)bpm_.load();
 
@@ -897,6 +1025,12 @@ extern "C" {
   EMSCRIPTEN_KEEPALIVE int vial_daw_capture_stop() { return daw() ? daw()->stopCapture() : 0; }
   EMSCRIPTEN_KEEPALIVE float* vial_daw_capture_data(int channel) { return daw() ? daw()->captureData(channel) : nullptr; }
   EMSCRIPTEN_KEEPALIVE void vial_daw_capture_free() { if (daw()) daw()->freeCapture(); }
+  EMSCRIPTEN_KEEPALIVE void vial_host_enable(int pairs) { if (daw()) daw()->hostEnable(pairs); }
+  EMSCRIPTEN_KEEPALIVE void vial_host_note(int track, int note, int velocity, int on, int frame) { if (daw()) daw()->hostNote(track, note, velocity, on != 0, frame); }
+  EMSCRIPTEN_KEEPALIVE int vial_host_render_position() { return flweb_render_position.load(); }
+  EMSCRIPTEN_KEEPALIVE void vial_host_offline_begin() { if (daw()) daw()->offlineBegin(); }
+  EMSCRIPTEN_KEEPALIVE void vial_host_offline_end() { if (daw()) daw()->offlineEnd(); }
+  EMSCRIPTEN_KEEPALIVE int vial_host_offline_render(float* out, int frames) { return daw() ? daw()->offlineRender(out, frames) : 0; }
   EMSCRIPTEN_KEEPALIVE void vial_daw_panic() { if (daw()) daw()->panic(); }
   EMSCRIPTEN_KEEPALIVE int vial_daw_keyboard_offset(int offset) { return daw() ? daw()->keyboardOffset(offset) : 48; }
   EMSCRIPTEN_KEEPALIVE int vial_daw_text_focused() {
